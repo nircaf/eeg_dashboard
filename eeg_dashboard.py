@@ -62,8 +62,11 @@ def validate_edf_file(file_path):
         if isinstance(file_path, str) and file_path.lower().endswith(('.pkl', '.pickle')):
             with open(file_path, 'rb') as f:
                 raw = pickle.load(f)
+            # Ensure data is loaded for pickled objects
+            if not raw.preload:
+                raw.load_data()
         else:
-            # Assume EDF by default
+            # Assume EDF by default (preload=False for validation, will be loaded later)
             raw = mne.io.read_raw_edf(file_path, preload=False, verbose=False)
         
         # Extract basic information
@@ -100,7 +103,7 @@ def validate_edf_file(file_path):
 def load_edf_data(file_path, max_channels=20):
     """Load EDF data with error handling using MNE"""
     try:
-        # Read the EDF file with MNE
+        # Read the EDF file with MNE (preload=True to load data into memory)
         raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
         
         # Get basic information
@@ -129,6 +132,118 @@ def load_edf_data(file_path, max_channels=20):
     except Exception as e:
         st.error(f"Error loading EDF data: {str(e)}")
         return None
+
+def preprocess_eeg_data(eeg_data,
+                        l_freq: float = 0.1,
+                        h_freq: float = 100.0,
+                        notch_freq: float = 50.0,
+                        apply_pyprep: bool = True,
+                        apply_autoreject: bool = True,
+                        epoch_length: float = 1.0):
+    """
+    Preprocess eeg_data and return an updated eeg_data dict.
+    Steps:
+      - Load data into memory
+      - Bandpass filter (l_freq .. h_freq)
+      - Notch filter at notch_freq
+      - Optional: PrepPipeline (pyprep)
+      - Optional: Autoreject (autoreject) using fixed-length epochs
+
+    Notes:
+      - Expects eeg_data to contain a key 'raw' with an MNE Raw object.
+      - Returns a new eeg_data dict reflecting any changes (or the original on failure).
+    """
+    with st.spinner(text="Preprocessing EEG data..."):
+        # Check 
+        if eeg_data is None or 'raw' not in eeg_data or eeg_data['raw'] is None:
+            return eeg_data
+
+        raw = eeg_data['raw']
+        
+        # Load data into memory if not already loaded
+        try:
+            if not raw.preload:
+                raw.load_data()
+                st.info("Data loaded into memory for preprocessing.")
+        except Exception as e:
+            st.warning(f"Failed to load data into memory: {e}")
+            return eeg_data
+        
+        # Bandpass filter
+        try:
+            raw.filter(l_freq=l_freq, h_freq=h_freq, fir_design='firwin', verbose=False)
+            st.info(f"Applied bandpass filter ({l_freq} - {h_freq} Hz).")
+        except Exception as e:
+            st.warning(f"Bandpass filtering failed: {e}")
+
+        # Notch (mains) filter
+        try:
+            raw.notch_filter(freqs=notch_freq, verbose=False)
+            st.info(f"Applied notch filter at {notch_freq} Hz.")
+        except Exception as e:
+            st.warning(f"Notch filtering failed: {e}")
+
+        # PrepPipeline (pyprep) - optional
+        if apply_pyprep:
+            try:
+                from pyprep.prep_pipeline import PrepPipeline
+                st.info("Running PrepPipeline (pyprep)...")
+                data_array = raw.get_data().copy()
+                srate = int(raw.info.get('sfreq', np.nan))
+                pp = PrepPipeline(data_array, srate, raw.ch_names)
+                pp.run_prep()
+                cleaned = pp.get_data()
+                if cleaned is not None and cleaned.shape == raw.get_data().shape:
+                    raw._data = cleaned
+                    st.success("PrepPipeline completed and data updated.")
+                else:
+                    st.info("PrepPipeline returned no data or unexpected shape; skipped applying it.")
+            except Exception:
+                st.info("PrepPipeline not applied (pyprep not installed or failed).")
+
+        # Autoreject - optional
+        if apply_autoreject:
+            try:
+                from autoreject import AutoReject
+                st.info("Running Autoreject (autoreject)...")
+                try:
+                    events = mne.make_fixed_length_events(raw, id=1, duration=epoch_length)
+                    epochs = mne.Epochs(raw, events, tmin=0.0, tmax=epoch_length, baseline=None, preload=True, verbose=False)
+                    ar = AutoReject()
+                    epochs_clean = ar.fit_transform(epochs)
+                    if hasattr(epochs_clean, 'get_data'):
+                        cleaned_epochs_data = epochs_clean.get_data()
+                    else:
+                        cleaned_epochs_data = epochs_clean
+                    # cleaned_epochs_data: (n_epochs, n_channels, n_times)
+                    cleaned = cleaned_epochs_data.transpose(1, 0, 2).reshape(cleaned_epochs_data.shape[1], -1)
+                    n_orig = raw.n_times
+                    if cleaned.shape[1] >= n_orig:
+                        raw._data = cleaned[:, :n_orig]
+                    else:
+                        tail = raw.get_data()[:, cleaned.shape[1]:n_orig]
+                        raw._data = np.concatenate([cleaned, tail], axis=1)
+                    st.success("Autoreject applied and data updated.")
+                except Exception as e_inner:
+                    st.info(f"Autoreject could not be applied to epochs: {e_inner}")
+            except Exception:
+                st.info("Autoreject not applied (package not installed or failed).")
+
+        # Rebuild eeg_data to reflect any changes and limit channels for performance
+        try:
+            n_channels = len(raw.ch_names)
+            channels_to_load = min(n_channels, 20)
+            eeg_data_out = {
+                'data': raw.get_data()[:channels_to_load, :],
+                'channel_names': raw.ch_names[:channels_to_load],
+                'sampling_rates': [raw.info.get('sfreq', np.nan)] * channels_to_load,
+                'n_channels': channels_to_load,
+                'n_samples': raw.n_times,
+                'raw': raw
+            }
+            return eeg_data_out
+        except Exception:
+            return eeg_data
 
 def calculate_eeg_quality_metrics(data, sampling_rate):
     """Calculate comprehensive EEG quality metrics"""
@@ -486,6 +601,11 @@ def main():
                 if validation_result.get('raw_obj') is not None:
                     raw = validation_result['raw_obj']
                     try:
+                        # Ensure data is loaded into memory
+                        if not raw.preload:
+                            raw.load_data()
+                            st.info("Data loaded into memory from validation.")
+                        
                         n_channels = len(raw.ch_names)
                         n_samples = len(raw.times)
                         sampling_rate = raw.info.get('sfreq', np.nan)
@@ -509,6 +629,11 @@ def main():
                     eeg_data = load_edf_data(file_path)
             
             if eeg_data is not None:
+                # Preprocess loaded data (filtering, notch, optional pyprep/autoreject)
+                try:
+                    eeg_data = preprocess_eeg_data(eeg_data)
+                except Exception as e:
+                    st.info(f"Preprocessing skipped/failed: {e}")
                 # Calculate quality metrics
                 with st.spinner("Calculating quality metrics..."):
                     metrics, freqs, psd = calculate_eeg_quality_metrics(

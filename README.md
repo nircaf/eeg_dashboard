@@ -88,3 +88,36 @@ Results are color-coded:
 - 🟢 Green: Excellent quality
 - 🟡 Yellow: Good quality with minor issues
 - 🔴 Red: Poor quality requiring attention
+
+## Troubleshooting
+
+### MNE filtering errors
+- **Problem**: "RuntimeError: inst.filter requires raw data to be loaded"
+- **Solution**: The dashboard automatically handles data loading. If you encounter this error, ensure you're using the latest version of the dashboard.
+
+### Python not found
+- **Problem**: "Python was not found" error
+- **Solution**: 
+  1. Install Python from https://python.org
+  2. During installation, check "Add Python to PATH"
+  3. Restart your command prompt/PowerShell
+
+### Package installation fails
+- **Problem**: pip install fails
+- **Solution**:
+  ```bash
+  python -m pip install --upgrade pip
+  pip install -r requirements.txt
+  ```
+
+### Permission errors on Windows
+- **Problem**: Permission denied when installing packages
+- **Solution**: Run PowerShell as Administrator, then:
+  ```powershell
+  Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+  .\run_dashboard.ps1
+  ```
+
+### Port already in use
+- **Problem**: Port 8501 is already in use
+- **Solution**: The dashboard will automatically use the next available port (8502, 8503, etc.)
