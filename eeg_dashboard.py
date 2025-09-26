@@ -755,7 +755,7 @@ def main():
     st.sidebar.markdown("**Example File:**")
     col1, col2 = st.sidebar.columns(2)
     with col1:
-        if st.button("Load Example"):
+        if st.button("Load Controls Example"):
             example_path = "Tests/edf_files/DA0016KH.edf"
             try:
                 uploaded_file = example_path
