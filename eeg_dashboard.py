@@ -55,6 +55,68 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ---------- Helpers for persistence across refresh ----------
+def _get_query_params():
+    try:
+        # Streamlit >= 1.30
+        return dict(st.query_params)
+    except Exception:
+        try:
+            # Older Streamlit
+            return st.experimental_get_query_params()
+        except Exception:
+            return {}
+
+def _set_query_params(**params):
+    try:
+        # Streamlit >= 1.30 (mutable mapping)
+        for k, v in params.items():
+            st.query_params[k] = str(v)
+    except Exception:
+        try:
+            # Older Streamlit
+            st.experimental_set_query_params(**{k: str(v) for k, v in params.items()})
+        except Exception:
+            pass
+
+def _clear_query_params():
+    try:
+        st.query_params.clear()
+    except Exception:
+        try:
+            st.experimental_set_query_params()
+        except Exception:
+            pass
+
+def _get_persisted_number(key: str, default: float):
+    qp = _get_query_params()
+    val = qp.get(key, None)
+    if isinstance(val, (list, tuple)):
+        val = val[0] if val else None
+    if val is None:
+        return float(default)
+    try:
+        return float(val)
+    except Exception:
+        return float(default)
+
+def persistent_slider(label, min_value, max_value, default_value, key: str, step=None):
+    # read current value from query params if present
+    v0 = _get_persisted_number(key, default_value)
+    # clamp into bounds
+    try:
+        v0 = max(float(min_value), min(float(max_value), float(v0)))
+    except Exception:
+        v0 = default_value
+    slider_args = dict(label=label, min_value=float(min_value), max_value=float(max_value), value=float(v0), key=key)
+    if step is not None:
+        slider_args["step"] = step
+    val = st.slider(**slider_args)
+    # write back so refresh keeps it
+    _set_query_params(**{key: val})
+    return float(val)
+# -----------------------------------------------------------
+
 def validate_edf_file(file_path):
     """Validate if the uploaded file is a valid EDF file or a pickled MNE Raw object"""
     try:
@@ -314,9 +376,143 @@ def detect_artifacts(data, sampling_rate):
     
     return artifacts
 
+def _normalized_autocorr(sig, max_lag):
+    """Return normalized autocorrelation up to max_lag samples."""
+    z = sig - np.mean(sig)
+    denom0 = np.dot(z, z) + 1e-12
+    ac_full = np.correlate(z, z, mode='full')
+    ac = ac_full[len(z) - 1: len(z) - 1 + max_lag]
+    return ac / (ac[0] + 1e-12)
+
+def ecg_likelihood_from_signal(x, fs):
+    """
+    Estimate likelihood (0..100) that a 1D channel is ECG based on:
+      - Cardiac periodicity via autocorrelation peak at 40–150 bpm (0.4–1.5 s)
+      - QRS sharpness via high-percentile absolute derivative normalized by signal std
+    Returns a float percent in [0, 100].
+    """
+    import numpy as _np
+    try:
+        x = _np.asarray(x, dtype=float)
+        if x.size < max(10, int(fs * 0.8)):
+            return 0.0
+        if not _np.all(_np.isfinite(x)):
+            x = _np.nan_to_num(x)
+
+        # Periodicity index (normalized autocorr peak in HR lag window)
+        try:
+            max_lag = int(min(x.size - 1, fs * 2.0))
+            if max_lag <= 1:
+                periodicity_idx = 0.0
+            else:
+                ac = _normalized_autocorr(x, max_lag)
+                lag_min = int(max(1, fs * 0.4))   # ~150 bpm lower bound
+                lag_max = int(min(ac.size - 1, fs * 1.5))  # ~40 bpm upper bound
+                if lag_max > lag_min:
+                    seg = ac[lag_min:lag_max]
+                    peak_val = float(seg[_np.argmax(seg)])
+                    periodicity_idx = float(_np.clip(peak_val, 0.0, 1.0))
+                else:
+                    periodicity_idx = 0.0
+        except Exception:
+            periodicity_idx = 0.0
+
+        # QRS sharpness index (99th percentile of |dx| normalized by std)
+        try:
+            dx = _np.diff(x)
+            p99 = float(_np.percentile(_np.abs(dx), 99.0))
+            stdx = float(_np.std(x) + 1e-12)
+            sharp_norm = p99 / stdx
+            sharp_idx = float(_np.tanh(sharp_norm))  # squash to [0,1)
+        except Exception:
+            sharp_idx = 0.0
+
+        score01 = float(_np.clip(0.6 * periodicity_idx + 0.4 * sharp_idx, 0.0, 1.0))
+        return 100.0 * score01
+    except Exception:
+        return 0.0
+
+def compute_ecg_eeg_scores(data, fs, channel_names):
+    """
+    Compute per-channel likelihood scores for ECG vs EEG using numeric features only:
+      - Spectral ratio: power around heart rate (0.8–2.5 Hz) and its harmonics vs broadband (0.5–40 Hz)
+      - Autocorrelation periodicity: prominent peak at 0.4–1.5 s lag (40–150 bpm)
+      - QRS sharpness: 99th percentile of |diff(signal)| normalized by signal std
+    Returns a DataFrame with ECG_score in [0,1], EEG_score=1-ECG_score, predicted label and HR estimate.
+    """
+    results = []
+    n_ch = min(len(channel_names), data.shape[0])
+    for i in range(n_ch):
+        ch = channel_names[i]
+        x = data[i, :].astype(float)
+        if not np.all(np.isfinite(x)):
+            x = np.nan_to_num(x)
+
+        # Spectral features
+        try:
+            nperseg = int(min(2048, max(256, len(x) // 4)))
+            freqs, psd = signal.welch(x, fs=fs, nperseg=nperseg)
+            band = (freqs >= 0.5) & (freqs <= 40.0)
+            hr = (freqs >= 0.8) & (freqs <= 2.5)
+            harm = (freqs >= 1.6) & (freqs <= 5.0)
+            psd_band = float(np.mean(psd[band]) + 1e-12)
+            spectral_ratio = float((np.mean(psd[hr]) + 0.5 * np.mean(psd[harm])) / psd_band)
+            # Scale ratio to [0,1] with a soft threshold
+            spectral_idx = float(np.clip(spectral_ratio / 0.25, 0.0, 1.0))
+        except Exception:
+            spectral_ratio = 0.0
+            spectral_idx = 0.0
+
+        # Autocorrelation periodicity (heart rate ~ 40–150 bpm)
+        try:
+            max_lag = int(min(len(x) - 1, fs * 2.0))
+            ac = _normalized_autocorr(x, max_lag)
+            lag_min = int(max(1, fs * 0.4))
+            lag_max = int(min(len(ac) - 1, fs * 1.5))
+            if lag_max > lag_min:
+                seg = ac[lag_min:lag_max]
+                peak_idx_rel = int(np.argmax(seg))
+                peak_val = float(seg[peak_idx_rel])
+                lag_samples = lag_min + peak_idx_rel
+                hr_est_bpm = 60.0 * fs / lag_samples
+                periodicity_idx = float(np.clip(peak_val, 0.0, 1.0))
+            else:
+                periodicity_idx = 0.0
+                hr_est_bpm = float('nan')
+        except Exception:
+            periodicity_idx = 0.0
+            hr_est_bpm = float('nan')
+
+        # QRS sharpness
+        try:
+            dx = np.diff(x)
+            sharp = float(np.percentile(np.abs(dx), 99))
+            sharp_norm = float(sharp / (np.std(x) + 1e-12))
+            sharp_idx = float(np.tanh(sharp_norm))  # squash to [0,1)
+        except Exception:
+            sharp_norm = 0.0
+            sharp_idx = 0.0
+
+        # Combine indices
+        ecg_score = float(np.clip(0.4 * periodicity_idx + 0.35 * spectral_idx + 0.25 * sharp_idx, 0.0, 1.0))
+        eeg_score = 1.0 - ecg_score
+        predicted = 'ECG' if ecg_score >= 0.6 else 'EEG'
+
+        results.append({
+            'Channel': ch,
+            'ECG_score': round(ecg_score, 3),
+            'EEG_score': round(eeg_score, 3),
+            'Predicted': predicted,
+            'HR_est_bpm': None if not np.isfinite(hr_est_bpm) else round(float(hr_est_bpm), 1),
+            'periodicity': round(periodicity_idx, 3),
+            'spectral_ratio': round(spectral_ratio, 3),
+            'qrs_sharpness': round(sharp_norm, 3)
+        })
+    return pd.DataFrame(results)
+
 def plot_raw_eeg(data, channel_names, sampling_rate, start_time=0, duration=10):
     """Plot raw EEG signals with a consistent y-axis across subplots"""
-    n_channels = min(len(channel_names), 8)  # Limit to 8 channels for readability
+    n_channels = len(channel_names) # Limit to 8 channels for readability
     end_sample = min(int((start_time + duration) * sampling_rate), data.shape[1])
     start_sample = int(start_time * sampling_rate)
     
@@ -356,8 +552,8 @@ def plot_raw_eeg(data, channel_names, sampling_rate, start_time=0, duration=10):
             row=i+1, col=1
         )
         # Apply same y range to each subplot if available
-        if y_range is not None:
-            fig.update_yaxes(range=y_range, row=i+1, col=1)
+        # if y_range is not None:
+        #     fig.update_yaxes(range=y_range, row=i+1, col=1)
     
     fig.update_layout(
         height=200 * n_channels,
@@ -503,7 +699,13 @@ def create_raw_data_table(data, channel_names, sampling_rate, start_time=0, dura
     # Add each channel as a column
     for i, channel_name in enumerate(channel_names):
         if i < data.shape[0]:  # Make sure we don't exceed available channels
-            df_data[channel_name] = data[i, start_sample:end_sample]
+            segment = data[i, start_sample:end_sample]
+            try:
+                ecg_pct = int(round(ecg_likelihood_from_signal(segment, float(sampling_rate))))
+            except Exception:
+                ecg_pct = 0
+            labeled_name = f"{channel_name} (ECG {ecg_pct}%)"
+            df_data[labeled_name] = segment
     
     df = pd.DataFrame(df_data)
     
@@ -518,8 +720,35 @@ def main():
     uploaded_file = st.sidebar.file_uploader(
         "Choose a file (EDF or pickled MNE Raw)",
         type=['edf', 'pkl', 'pickle'],
-        help="Upload a valid EDF (.edf) or a pickled MNE Raw object (.pkl / .pickle)"
+        help="Upload a valid EDF (.edf) or a pickled MNE Raw object (.pkl / .pickle)",
+        key="edf_uploader"
     )
+    if uploaded_file is not None:
+        st.session_state['user_uploaded'] = True
+
+    # Restore previously chosen file after refresh (if any)
+    if uploaded_file is None:
+        # Prefer URL query params across hard refresh
+        qp = _get_query_params()
+        src = qp.get('src', None)
+        pth = qp.get('path', None)
+        if isinstance(src, (list, tuple)):
+            src = src[0] if src else None
+        if isinstance(pth, (list, tuple)):
+            pth = pth[0] if pth else None
+        if src in ('uploaded', 'example') and pth and os.path.exists(pth):
+            uploaded_file = pth
+        else:
+            # Fallback to session state (soft reruns)
+            file_source = st.session_state.get('file_source')
+            if file_source == 'uploaded':
+                saved_path = st.session_state.get('uploaded_path')
+                if saved_path and os.path.exists(saved_path):
+                    uploaded_file = saved_path
+            elif file_source == 'example':
+                ex_path = st.session_state.get('example_path')
+                if ex_path and os.path.exists(ex_path):
+                    uploaded_file = ex_path
     
     # Example file option
     st.sidebar.markdown("---")
@@ -527,10 +756,13 @@ def main():
     col1, col2 = st.sidebar.columns(2)
     with col1:
         if st.button("Load Example"):
-            example_path = "Tests/edf_files/FIRST EXAMPLE PATIENTSHORT.edf"
+            example_path = "Tests/edf_files/DA0016KH.edf"
             try:
                 uploaded_file = example_path
                 st.session_state['example_loaded'] = True
+                st.session_state['file_source'] = 'example'
+                st.session_state['example_path'] = example_path
+                _set_query_params(src='example', path=example_path)
                 st.sidebar.success("Example loaded!")
             except:
                 st.sidebar.error("Example not found!")
@@ -538,11 +770,25 @@ def main():
         if st.button("Clear"):
             uploaded_file = None
             st.session_state['example_loaded'] = False
+            # Clear any remembered file state
+            for k in ['user_uploaded', 'uploaded_path', 'file_source', 'example_path']:
+                if k in st.session_state:
+                    try:
+                        del st.session_state[k]
+                    except Exception:
+                        pass
+            # Remove temp file if exists
+            try:
+                if os.path.exists("temp_uploaded_file.edf"):
+                    os.remove("temp_uploaded_file.edf")
+            except Exception:
+                pass
+            _clear_query_params()
             st.sidebar.info("Cleared!")
     
     # Auto-load example file on first visit
-    if uploaded_file is None and not st.session_state.get('example_loaded', False):
-        example_path = "Tests/edf_files/FIRST EXAMPLE PATIENTSHORT.edf"
+    if uploaded_file is None and not st.session_state.get('example_loaded', False) and not st.session_state.get('user_uploaded', False):
+        example_path = "Tests/edf_files/DA0016KH.edf"
         if os.path.exists(example_path):
             uploaded_file = example_path
             st.session_state['example_loaded'] = True
@@ -557,6 +803,10 @@ def main():
             with open("temp_uploaded_file.edf", "wb") as f:
                 f.write(uploaded_file.getbuffer())
             file_path = "temp_uploaded_file.edf"
+            # Persist uploaded file path for refresh
+            st.session_state['uploaded_path'] = file_path
+            st.session_state['file_source'] = 'uploaded'
+            _set_query_params(src='uploaded', path=file_path)
         
         # Validate EDF file
         st.header("📋 File Validation")
@@ -644,6 +894,21 @@ def main():
                         eeg_data['data'], 
                         eeg_data['sampling_rates'][0]
                     )
+                    # Compute ECG vs EEG likelihood per channel
+                    # try:
+                    #     ecg_scores_df = compute_ecg_eeg_scores(
+                    #         eeg_data['data'],
+                    #         eeg_data['sampling_rates'][0],
+                    #         eeg_data['channel_names']
+                    #     )
+                    # except Exception as _e:
+                    ecg_scores_df = pd.DataFrame({
+                        'Channel': eeg_data['channel_names'],
+                        'ECG_score': [np.nan] * len(eeg_data['channel_names']),
+                        'EEG_score': [np.nan] * len(eeg_data['channel_names']),
+                        'Predicted': ['N/A'] * len(eeg_data['channel_names']),
+                        'HR_est_bpm': [np.nan] * len(eeg_data['channel_names'])
+                    })
                 
                 # Display quality metrics
                 st.subheader("🔍 Signal Quality Assessment")
@@ -710,18 +975,21 @@ def main():
                 
                 # Visualization tabs
                 st.subheader("📈 Visualizations")
-                tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Raw Data Table", "Channel Info", "Raw EEG", "Spectrogram", "Power Spectrum", "Artifact Analysis"])
+                tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([ "Raw EEG", "Raw Data Table", "Channel Info", "Spectrogram", "Power Spectrum", "Artifact Analysis"])
                 
-                with tab1:
+                with tab3:
                     st.subheader("Raw EEG Data Table")
                     st.markdown("**Interactive data table showing raw EEG values**")
                     
                     # Controls for data table
                     col1, col2, col3 = st.columns([2, 1, 1])
                     with col1:
-                        start_time = st.slider("Start Time (s)", 0.0, max(1.0, eeg_data['n_samples']/eeg_data['sampling_rates'][0]-5), 0.0, key="table_start")
+                        total_duration = float(eeg_data['n_samples'] / eeg_data['sampling_rates'][0])
+                        max_start = max(0.0, total_duration - 5.0)
+                        start_time = persistent_slider("Start Time (s)", 0.0, max_start, 0.0, key="table_start")
                     with col2:
-                        duration = st.slider("Duration (s)", 1.0, 10.0, 5.0, key="table_duration")
+                        default_duration = float(min(60.0, total_duration - start_time))
+                        duration = persistent_slider("Duration (s)", 1.0, total_duration, default_duration, key="table_duration")
                     with col3:
                         max_rows = st.selectbox("Max Rows", [100, 500, 1000, 5000], index=0)
                     
@@ -821,22 +1089,34 @@ def main():
                     else:
                         st.warning("Raw MNE object not available for detailed channel information")
                 
-                with tab3:
+                with tab1:
                     st.subheader("Raw EEG Signals")
                     col1, col2 = st.columns([3, 1])
                     with col1:
-                        start_time = st.slider("Start Time (s)", 0.0, max(1.0, eeg_data['n_samples']/eeg_data['sampling_rates'][0]-10), 0.0, key="plot_start")
+                        total_duration = float(eeg_data['n_samples'] / eeg_data['sampling_rates'][0])
+                        max_start = max(0.0, total_duration - 10.0)
+                        start_time = persistent_slider("Start Time (s)", 0.0, max_start, 0.0, key="plot_start")
                     with col2:
-                        duration = st.slider("Duration (s)", 1.0, 30.0, 10.0, key="plot_duration")
+                        duration = persistent_slider("Duration (s)", 1.0, 30.0, 10.0, key="plot_duration")
                     
-                    fig_raw = plot_raw_eeg(
-                        eeg_data['data'], 
-                        eeg_data['channel_names'], 
-                        eeg_data['sampling_rates'][0],
-                        start_time, 
-                        duration
-                    )
-                    st.plotly_chart(fig_raw, use_container_width=True)
+                    # Channel selection controls
+                    channel_options = eeg_data['channel_names']
+                    selected_channels = channel_options
+                    
+                    # Prepare data for plotting
+                    if selected_channels:
+                        idxs = [channel_options.index(ch) for ch in selected_channels if ch in channel_options]
+                        data_sel = eeg_data['data'][idxs, :]
+                        fig_raw = plot_raw_eeg(
+                            data_sel, 
+                            selected_channels, 
+                            eeg_data['sampling_rates'][0],
+                            start_time, 
+                            duration
+                        )
+                        st.plotly_chart(fig_raw, use_container_width=True)
+                    else:
+                        st.info("No channels selected. Please choose at least one channel to display.")
                 
                 with tab4:
                     st.subheader("Spectrogram Analysis")
@@ -882,6 +1162,28 @@ def main():
                         
                         df_artifacts = pd.DataFrame(artifact_data)
                         st.dataframe(df_artifacts, use_container_width=True)
+                        
+                        # EEG vs ECG likelihood per channel
+                        st.subheader("EEG vs ECG likelihood per channel")
+                        st.caption("Scores use cardiac periodicity (~1–2 Hz) and QRS sharpness; channel names are not used.")
+                        try:
+                            display_scores = ecg_scores_df[['Channel', 'ECG_score', 'EEG_score', 'Predicted', 'HR_est_bpm']]
+                            st.dataframe(display_scores, use_container_width=True)
+                            # Optional bar chart of ECG-likeness
+                            try:
+                                fig_ecg = px.bar(
+                                    ecg_scores_df,
+                                    x='Channel',
+                                    y='ECG_score',
+                                    color='Predicted',
+                                    title='ECG-likeness score by channel',
+                                    range_y=[0, 1]
+                                )
+                                st.plotly_chart(fig_ecg, use_container_width=True)
+                            except Exception:
+                                pass
+                        except Exception:
+                            st.info("ECG/EEG scoring not available.")
                 
                 # Summary and recommendations
                 st.subheader("📋 Analysis Summary")
